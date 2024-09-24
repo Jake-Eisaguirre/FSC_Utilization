@@ -1,0 +1,588 @@
+---
+title: "Freight Short Call Utilization"
+subtitle: "Crew Resource Planning"
+format: 
+  html:
+    self-contained: true
+editor: source
+toc: true
+theme: pulse
+title-block-banner: "#41369"
+last-modified:
+date: "`r Sys.Date()`"
+date-format: "YYYY-MM-DD"
+css: style.css
+---
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+
+if (!require(librarian)){
+  install.packages("librarian")
+  library(librarian)
+}
+
+# librarian downloads, if not already downloaded, and reads in needed packages
+librarian::shelf(tidyverse, here, janitor, lubridate, stringr, DBI, 
+                 odbc, DT, rstudioapi, dbplyr, plotly, emayili, fs)
+```
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+#| results: false
+
+### Connect to `Snowflake` Database
+tryCatch({
+    db_connection <- DBI::dbConnect(odbc::odbc(),
+                             Driver="SnowflakeDSIIDriver",
+                             Server="hawaiianair.west-us-2.azure.snowflakecomputing.com",
+                             WAREHOUSE="DATA_LAKE_READER",
+                             Database="ENTERPRISE",
+                             UID= Sys.getenv("UID"),
+                             authenticator = "externalbrowser")
+    print("Database Connected!")
+    },
+    error=function(cond) {
+            print("Unable to connect to Database.")
+})
+
+
+
+
+# Set search_path
+dbExecute(db_connection, "USE SCHEMA CREW_ANALYTICS")
+
+```
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+#| results: false
+
+### Query `CT_DEADHEAD`, `CT_FLIGHT_LEG`, and `CT_MASTER_PAIRING` Tables
+# - Filter `PAIRING_DATE` between current date to one year prior
+# - Filter `CREW_INDICATOR` for `P` and `FLIGHT_NO` for `FSC`
+
+
+fetch_data <- function(query, var_name) {
+  if (!exists(var_name, envir = .GlobalEnv)) {
+    assign(var_name, dbGetQuery(db_connection, query), envir = .GlobalEnv)
+    message(paste("Data fetched and stored in", var_name))
+  } else {
+    message(paste(var_name, "already exists. Skipping database query."))
+  }
+}
+
+# Deadhead Query
+q_deadhead <- "SELECT *
+               FROM CT_DEADHEAD
+               WHERE PAIRING_DATE BETWEEN DATEADD(YEAR, -1, CURRENT_DATE()) AND CURRENT_DATE()
+               AND CREW_INDICATOR = 'P'
+               AND FLIGHT_NO = 'FSC';"
+
+fetch_data(q_deadhead, "view_deadhead")
+
+# FlightLeg Query
+q_flightleg <- "SELECT *
+                FROM CT_FLIGHT_LEG
+                WHERE PAIRING_DATE BETWEEN DATEADD(YEAR, -1, CURRENT_DATE()) AND CURRENT_DATE()
+                AND CREW_INDICATOR = 'P';"
+
+fetch_data(q_flightleg, "view_flightleg")
+
+# MasterPairing Query
+q_masterpairing <- "SELECT *
+                    FROM CT_MASTER_PAIRING
+                    WHERE PAIRING_DATE BETWEEN DATEADD(YEAR, -1, CURRENT_DATE()) AND CURRENT_DATE()
+                    AND CREW_INDICATOR = 'P';"
+
+fetch_data(q_masterpairing, "view_masterpairing")
+
+
+```
+
+```{r}
+#| echo: false
+
+### Neccessary Data Cleaning Steps
+
+##### CT_DEADHEAD
+
+# -   Filter `PAIRING_NO` for partial match of `C250` to get all FSC flights
+# -   Concatenate `UPDATE_DATE` and `UPDATE_TIME` to `updated_dt`
+# -   Group by `FLIGHT_DATE`, `PAIRING_POSITION`
+# -   Filter for most recent `updated_dt` version
+# -   Filter for only `FSC` flight number
+
+clean_deadhead <- view_deadhead %>% 
+  filter(str_detect(PAIRING_NO, "C250")) %>% # FSC Days
+  mutate(updated_dt = paste(UPDATE_DATE, UPDATE_TIME, sep = " ")) %>% 
+  relocate(updated_dt, .after=PAIRING_NO) %>% 
+  group_by(FLIGHT_DATE, PAIRING_POSITION) %>% 
+  filter(updated_dt == max(updated_dt)) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id))
+  
+```
+
+```{r}
+#| echo: false
+
+##### CT_FLIGHT_LEG
+
+# -   Filter `PAIRING_NO` for partial match of `C250` to get all FSC flights
+# -   Concatenate `UPDATE_DATE` and `UPDATE_TIME` to `updated_dt`
+# -   Group by `DEPARTING_CITY`, `ARRIVAL_CITY`, `SEGMENT_POSITION`, `SCHED_DEPARTURE_DATE`, `SCHED_DEPARTURE_TIME`
+# -   Filter for most recent `updated_dt` version
+# -   Remove any `D` observations in `DEADHEAD` column
+
+
+clean_flightleg <- view_flightleg %>% 
+  filter(str_detect(PAIRING_NO, "C250")) %>% # FSC Days
+  mutate(updated_dt = paste0(UPDATE_DATE, UPDATE_TIME)) %>% 
+  relocate(updated_dt, .after=PAIRING_NO) %>% 
+  group_by(DEPARTING_CITY, ARRIVAL_CITY, SEGMENT_POSITION, SCHED_DEPARTURE_DATE, SCHED_DEPARTURE_TIME) %>% 
+  filter(updated_dt == max(updated_dt)) %>% 
+  filter(is.na(DEADHEAD))
+
+
+```
+
+```{r}
+#| echo: false
+
+##### CT_MASTER_PAIRING
+# 
+# -   Filter `PAIRING_NO` for partial match of `C250` to get all FSC flights
+# -   Concatenate `UPDATE_DATE` and `UPDATE_TIME` to `updated_dt`
+# -   Group by `CREW_ID` and `PAIRING_DATE`
+# -   Filter for most recent `updated_dt` version
+
+clean_masterpairing <- view_masterpairing %>% 
+  filter(str_detect(PAIRING_NO, "C250")) %>% # FSC Days
+  mutate(updated_dt = paste0(UPDATE_DATE, UPDATE_TIME)) %>% 
+  relocate(updated_dt, .after=PAIRING_NO) %>% 
+  group_by(PAIRING_DATE, CREW_ID) %>% # Some updated times occurred at the same time
+  filter(updated_dt == max(updated_dt)) %>% 
+  mutate(temp_id = cur_group_id())
+
+```
+
+```{r}
+#| message: false
+#| warning: false
+#| echo: false
+
+#### Feight Short Call Reserve Pilots Called Up
+# - Join `clean_flightleg` onto `clean_masterpairing` by `PAIRING_DATE` and `PAIRING_NO`
+
+fl_mp <- clean_flightleg %>% 
+  left_join(clean_masterpairing, by = c("PAIRING_DATE", "PAIRING_NO")) %>% 
+  relocate(SEGMENT_POSITION, .after = FLIGHT_NO) %>% 
+  relocate(CREW_ID, .after = SEGMENT_POSITION) %>% 
+  relocate(PAIRING_STATUS, .after = SCHED_DEPARTURE_DATE) %>% 
+  drop_na(CREW_ID) %>% 
+  select(c(FLIGHT_NO:PAIRING_NO), PAIRING_DATE, SCHED_DEPARTURE_DATE, 
+         SCHED_DEPARTURE_TIME,  SCHED_ARRIVAL_DATE, SCHED_ARRIVAL_TIME) %>% 
+  arrange(desc(SCHED_DEPARTURE_DATE)) %>% 
+  group_by(CREW_ID, SCHED_DEPARTURE_DATE) %>% 
+  filter(!duplicated(CREW_ID))
+
+
+```
+
+### Freight Short Call Reserve Utilization
+
+```{r}
+#| echo: false
+
+### Total Population of FSC periods
+
+#-   FSC periods from `clean_deadhead` + `fl_mp`
+
+
+total_population <- (nrow(clean_deadhead) + nrow(fl_mp))
+
+
+
+```
+
+```{r}
+#| echo: false
+
+fsc_called_up <- nrow(fl_mp)
+
+ans <- round(((fsc_called_up/total_population)*100), 2)
+
+```
+
+**`r ans` %** of Freight Short Call periods utilized between both Captains and First Officers across **`r total_population` total** Freight Short Call periods from **`r min(clean_deadhead$FLIGHT_DATE)`** to **`r max(clean_deadhead$FLIGHT_DATE)`**.
+
+#### Percent Utilization of Freight Short Call Reserve Captains and First Officers per Month
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+
+m_m_tot_fl_mp <- fl_mp %>% 
+  ungroup() %>% 
+  select(FLIGHT_DATE, DEPARTING_CITY, ARRIVAL_CITY)
+
+
+m_m_tot <- clean_deadhead %>% 
+  ungroup() %>% 
+  select(FLIGHT_DATE, DEPARTING_CITY, ARRIVAL_CITY) %>% 
+  rbind(m_m_tot_fl_mp) %>% 
+  mutate(flight_month = month(FLIGHT_DATE),
+         flight_year = year(FLIGHT_DATE),
+         flight_ym = paste(flight_year, flight_month, sep="-")) %>% 
+  group_by(flight_ym) %>% 
+  summarise(sum_month = sum(n()))
+
+
+
+m_m_ut <- fl_mp %>% 
+  mutate(flight_month = month(FLIGHT_DATE),         
+         flight_year = year(FLIGHT_DATE),
+         flight_ym = paste(flight_year, flight_month, sep="-")) %>% 
+  group_by(flight_ym, SEGMENT_POSITION) %>% 
+  reframe(sum_ut = sum(n())) %>% 
+  ungroup() %>% 
+  complete(flight_ym, SEGMENT_POSITION) %>% 
+  inner_join(m_m_tot, by = c("flight_ym")) %>% 
+  mutate(sum_ut = if_else(is.na(sum_ut), 0, sum_ut)) %>% 
+  mutate(perc_ut = (sum_ut/(sum_month)*100))
+
+
+
+
+min_month_year <- min(m_m_ut$flight_ym)
+start_date <- ymd(paste0(min_month_year, "1"))
+end_date <- ceiling_date(Sys.Date(), "month") - months(1)
+
+all_dates <- seq(start_date, end_date, by = "month")
+
+# Create a dataframe with all month-year combinations
+complete_combinations <- data.frame(
+  flight_ym = format(all_dates, "%Y-%m"),
+  SEGMENT_POSITION = rep(c("CA", "FO"), each = length(all_dates))
+)
+
+# Remove trailing zeroes after the dash
+complete_combinations$flight_ym <- gsub("-0([1-9])", "-\\1", complete_combinations$flight_ym)
+
+missing_dates <- anti_join(complete_combinations, m_m_ut)
+
+
+complete_data <- m_m_ut %>% 
+  full_join(missing_dates)
+
+
+ggplot(complete_data, aes(x = factor(flight_ym), y = perc_ut, fill = SEGMENT_POSITION)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = ifelse(perc_ut == 0, NA, sprintf("%.2f", perc_ut))), 
+            position = position_stack(vjust = 0.5), 
+            color = "white", size = 3) +
+  geom_hline(yintercept = ans, color = "#EF3138", linetype = "dashed", size = 1) +
+  labs(x = "Year-Month", y = "Percent Utilization", fill = "Position") +
+  theme_minimal() +
+  scale_fill_manual(values = c("FO" = "#413691", "CA" = "#D2058A")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+#### Individual Captain and First Officer Utilization
+
+```{r}
+#| echo: false
+
+fl_mp %>% 
+    datatable()
+```
+
+$~$ 
+
+$~$
+
+### Data Pipeline
+
+$~$
+
+##### Packages
+
+```{r}
+#| code-fold: true
+#| message: false
+#| warning: false
+#| eval: false
+
+if (!require(librarian)){
+  install.packages("librarian")
+  library(librarian)
+}
+
+# librarian downloads, if not already downloaded, and reads in needed packages
+librarian::shelf(tidyverse, here, janitor, lubridate, stringr, DBI, 
+                 odbc, DT, rstudioapi, dbplyr, plotly)
+```
+
+##### Database Connection
+
+```{r}
+#| code-fold: true
+#| message: false
+#| warning: false
+#| results: false
+#| eval: false
+
+### Connect to `Snowflake` Database
+tryCatch({
+    db_connection <- DBI::dbConnect(odbc::odbc(),
+                             Driver="SnowflakeDSIIDriver",
+                             Server="hawaiianair.west-us-2.azure.snowflakecomputing.com",
+                             WAREHOUSE="DATA_LAKE_READER",
+                             Database="ENTERPRISE",
+                             UID= Sys.getenv("UID"),
+                             authenticator = "externalbrowser")
+    print("Database Connected!")
+    },
+    error=function(cond) {
+            print("Unable to connect to Database.")
+})
+
+
+
+
+# Set search_path
+dbExecute(db_connection, "USE SCHEMA CREW_ANALYTICS")
+
+```
+
+##### Query `CT_DEADHEAD`, `CT_FLIGHT_LEG`, and `CT_MASTER_PAIRING` Tables
+
+-   Filter `PAIRING_DATE` between current date to one year prior
+-   Filter `CREW_INDICATOR` for `P` and `FLIGHT_NO` for `FSC`
+
+```{r}
+#| code-fold: true
+#| message: false
+#| warning: false
+#| results: false
+#| eval: false
+
+
+fetch_data <- function(query, var_name) {
+  if (!exists(var_name, envir = .GlobalEnv)) {
+    assign(var_name, dbGetQuery(db_connection, query), envir = .GlobalEnv)
+    message(paste("Data fetched and stored in", var_name))
+  } else {
+    message(paste(var_name, "already exists. Skipping database query."))
+  }
+}
+
+# Deadhead Query
+q_deadhead <- "SELECT *
+               FROM CT_DEADHEAD
+               WHERE PAIRING_DATE BETWEEN DATEADD(YEAR, -1, CURRENT_DATE()) AND CURRENT_DATE()
+               AND CREW_INDICATOR = 'P'
+               AND FLIGHT_NO = 'FSC';"
+
+fetch_data(q_deadhead, "view_deadhead")
+
+# FlightLeg Query
+q_flightleg <- "SELECT *
+                FROM CT_FLIGHT_LEG
+                WHERE PAIRING_DATE BETWEEN DATEADD(YEAR, -1, CURRENT_DATE()) AND CURRENT_DATE()
+                AND CREW_INDICATOR = 'P';"
+
+fetch_data(q_flightleg, "view_flightleg")
+
+# MasterPairing Query
+q_masterpairing <- "SELECT *
+                    FROM CT_MASTER_PAIRING
+                    WHERE PAIRING_DATE BETWEEN DATEADD(YEAR, -1, CURRENT_DATE()) AND CURRENT_DATE()
+                    AND CREW_INDICATOR = 'P';"
+
+fetch_data(q_masterpairing, "view_masterpairing")
+
+
+```
+
+#### Necessary Data Cleaning Steps
+
+$~$
+
+##### CT_DEADHEAD
+
+-   Filter `PAIRING_NO` for partial match of `C250` to get all FSC flights
+-   Concatenate `UPDATE_DATE` and `UPDATE_TIME` to `updated_dt`
+-   Group by `SCHED_DEPARTURE_DATE`, `PAIRING_POSITION`
+-   Filter for most recent `updated_dt` version
+
+```{r}
+#| code-fold: true
+#| eval: false
+
+clean_deadhead <- view_deadhead %>% 
+  filter(str_detect(PAIRING_NO, "C250")) %>% # FSC Days
+  mutate(updated_dt = paste(UPDATE_DATE, UPDATE_TIME, sep = " ")) %>% 
+  relocate(updated_dt, .after=PAIRING_NO) %>% 
+  group_by(SCHED_DEPARTURE_DATE, PAIRING_POSITION) %>% 
+  filter(updated_dt == max(updated_dt)) %>% 
+  mutate(temp_id = cur_group_id()) %>% 
+  filter(!duplicated(temp_id))
+  
+```
+
+##### CT_FLIGHT_LEG
+
+-   Filter `PAIRING_NO` for partial match of `C250` to get all FSC flights
+-   Concatenate `UPDATE_DATE` and `UPDATE_TIME` to `updated_dt`
+-   Group by `DEPARTING_CITY`, `ARRIVAL_CITY`, `SEGMENT_POSITION`, `SCHED_DEPARTURE_DATE`, `SCHED_DEPARTURE_TIME`
+-   Filter for most recent `updated_dt` version
+-   Remove any `D` observations in `DEADHEAD` column
+
+```{r}
+#| code-fold: true
+#| eval: false
+
+
+clean_flightleg <- view_flightleg %>% 
+  filter(str_detect(PAIRING_NO, "C250")) %>% # FSC Days
+  mutate(updated_dt = paste0(UPDATE_DATE, UPDATE_TIME)) %>% 
+  relocate(updated_dt, .after=PAIRING_NO) %>% 
+  group_by(DEPARTING_CITY, ARRIVAL_CITY, SEGMENT_POSITION, SCHED_DEPARTURE_DATE, SCHED_DEPARTURE_TIME) %>% 
+  filter(updated_dt == max(updated_dt)) %>% 
+  filter(is.na(DEADHEAD))
+
+
+```
+
+##### CT_MASTER_PAIRING
+
+-   Filter `PAIRING_NO` for partial match of `C250` to get all FSC flights
+-   Concatenate `UPDATE_DATE` and `UPDATE_TIME` to `updated_dt`
+-   Group by `CREW_ID` and `PAIRING_DATE`
+-   Filter for most recent `updated_dt` version
+
+```{r}
+#| code-fold: true
+#| eval: false
+
+clean_masterpairing <- view_masterpairing %>% 
+  filter(str_detect(PAIRING_NO, "C250")) %>% # FSC Days
+  mutate(updated_dt = paste0(UPDATE_DATE, UPDATE_TIME)) %>% 
+  relocate(updated_dt, .after=PAIRING_NO) %>% 
+  group_by(PAIRING_DATE, CREW_ID) %>% # Some updated times occurred at the same time
+  filter(updated_dt == max(updated_dt)) %>% 
+  mutate(temp_id = cur_group_id())
+
+```
+
+##### Freight Short Call Reserve Pilots Called Up
+
+-   Join `clean_flightleg` onto `clean_masterpairing` by `PAIRING_DATE` and `PAIRING_NO`
+
+```{r}
+#| message: false
+#| warning: false
+#| code-fold: true
+#| eval: false
+
+fl_mp <- clean_flightleg %>% 
+  left_join(clean_masterpairing, by = c("PAIRING_DATE", "PAIRING_NO")) %>% 
+  relocate(SEGMENT_POSITION, .after = FLIGHT_NO) %>% 
+  relocate(CREW_ID, .after = SEGMENT_POSITION) %>% 
+  relocate(PAIRING_STATUS, .after = SCHED_DEPARTURE_DATE) %>% 
+  drop_na(CREW_ID) %>% 
+  select(c(FLIGHT_NO:PAIRING_NO), PAIRING_DATE, SCHED_DEPARTURE_DATE, 
+         SCHED_DEPARTURE_TIME,  SCHED_ARRIVAL_DATE, SCHED_ARRIVAL_TIME) %>% 
+  arrange(desc(SCHED_DEPARTURE_DATE)) %>% 
+  group_by(CREW_ID, SCHED_DEPARTURE_DATE) %>% 
+  filter(!duplicated(CREW_ID))
+
+
+```
+
+##### Percent Utilization of Freight Short Call Reserve Captains or First Officers per Month
+
+-   Sum year-monthly flight periods
+-   Sum CA and FO utilization per year-month
+-   Calculate percent CA and FO utilized per year-month
+-   Visualize
+
+```{r}
+#| code-fold: true
+#| eval: false
+
+# all FSC periods in which a pilot was called up
+m_m_tot_fl_mp <- fl_mp %>% 
+  ungroup() %>% 
+  select(FLIGHT_DATE, DEPARTING_CITY, ARRIVAL_CITY)
+
+# all possible FSC periods and periods in which a pilot was called up
+m_m_tot <- clean_deadhead %>% 
+  ungroup() %>% 
+  select(FLIGHT_DATE, DEPARTING_CITY, ARRIVAL_CITY) %>% 
+  rbind(m_m_tot_fl_mp) %>% 
+  mutate(flight_month = month(FLIGHT_DATE),
+         flight_year = year(FLIGHT_DATE),
+         flight_ym = paste(flight_year, flight_month, sep="-")) %>% 
+  group_by(flight_ym) %>% 
+  summarise(sum_month = sum(n()))
+
+
+# FSC periods in which a pilot was called uo
+m_m_ut <- fl_mp %>% 
+  mutate(flight_month = month(FLIGHT_DATE),         
+         flight_year = year(FLIGHT_DATE),
+         flight_ym = paste(flight_year, flight_month, sep="-")) %>% 
+  group_by(flight_ym, SEGMENT_POSITION) %>% 
+  reframe(sum_ut = sum(n())) %>% 
+  ungroup() %>% 
+  complete(flight_ym, SEGMENT_POSITION) %>% 
+  inner_join(m_m_tot, by = c("flight_ym")) %>% 
+  mutate(sum_ut = if_else(is.na(sum_ut), 0, sum_ut)) %>% 
+  mutate(perc_ut = (sum_ut/(sum_month)*100))
+
+
+
+# list of all year-month combos
+min_month_year <- min(m_m_ut$flight_ym)
+start_date <- ymd(paste0(min_month_year, "1"))
+end_date <- ceiling_date(Sys.Date(), "month") - months(1)
+all_dates <- seq(start_date, end_date, by = "month")
+
+# Create a dataframe with all month-year combinations
+complete_combinations <- data.frame(
+  flight_ym = format(all_dates, "%Y-%m"),
+  SEGMENT_POSITION = rep(c("CA", "FO"), each = length(all_dates))
+)
+
+# Remove trailing zeroes after the dash
+complete_combinations$flight_ym <- gsub("-0([1-9])", "-\\1", complete_combinations$flight_ym)
+
+# year-month combos with no data
+missing_dates <- anti_join(complete_combinations, m_m_ut)
+
+# complete data frame with zero year-months
+complete_data <- m_m_ut %>% 
+  full_join(missing_dates)
+
+# Make ggplot
+ggplot(complete_data, aes(x = factor(flight_ym), y = perc_ut, fill = SEGMENT_POSITION)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = ifelse(perc_ut == 0, NA, sprintf("%.2f", perc_ut))), 
+            position = position_stack(vjust = 0.5), 
+            color = "white", size = 3) +
+  geom_hline(yintercept = ans, color = "#EF3138", linetype = "dashed", size = 1) +
+  labs(x = "Year-Month", y = "Percent Utilization", fill = "Position") +
+  theme_minimal() +
+  scale_fill_manual(values = c("FO" = "#413691", "CA" = "#D2058A")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```

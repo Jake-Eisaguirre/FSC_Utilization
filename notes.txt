@@ -1,0 +1,19 @@
+FSC Utilization
+(freight schort call reserve)
+.Reserve utilization for freighter
+.FSC gets replaced with flight
+.How many times did FSC code convert to block flight time January-June
+
+.dead head table and flight leg and master pairing
+	cancate update date and time, take most recent record
+
+.flight leg
+	remove "d" from table
+
+.master pairing
+	join onto flight leg by prgid_prgdate
+
+total pop
+	fsc days from dead head plus all of flight leg
+
+Check Status I or A and ground truth with crew trac
